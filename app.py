@@ -2,14 +2,18 @@ import cv2
 import numpy as np
 import os
 import tempfile
+import subprocess
 from datetime import datetime
+
 from ultralytics import YOLO
 import streamlit as st
+import imageio_ffmpeg
 
 
 # ==========================================
 # Configuration
 # ==========================================
+
 MODEL_PATH = "models/best.pt"
 
 CONF_THRESHOLD_SEARCH = 0.35
@@ -23,6 +27,7 @@ MAX_ASPECT_RATIO = 1.8
 # ==========================================
 # Single Ball Tracker
 # ==========================================
+
 class SingleBallTracker:
 
     def __init__(self):
@@ -43,6 +48,10 @@ class SingleBallTracker:
 
     def process_frame(self, detections):
 
+        # ==========================================
+        # No detections
+        # ==========================================
+
         if len(detections) == 0:
 
             self.lost_frames += 1
@@ -57,6 +66,7 @@ class SingleBallTracker:
         # ==========================================
         # SEARCHING
         # ==========================================
+
         if self.state == "SEARCHING":
 
             best_conf = CONF_THRESHOLD_SEARCH
@@ -90,6 +100,7 @@ class SingleBallTracker:
         # ==========================================
         # TRACKING
         # ==========================================
+
         elif self.state == "TRACKING":
 
             best_score = -999
@@ -103,6 +114,7 @@ class SingleBallTracker:
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
 
+                # Distance from previous ball position
                 dist = np.hypot(
                     cx - cx_last,
                     cy - cy_last
@@ -115,12 +127,20 @@ class SingleBallTracker:
                     dist / self.max_distance
                 )
 
-                area_ratio = (
-                    min(area, self.last_area)
-                    /
-                    max(area, self.last_area)
-                )
+                # Area similarity
+                if self.last_area > 0 and area > 0:
 
+                    area_ratio = (
+                        min(area, self.last_area)
+                        /
+                        max(area, self.last_area)
+                    )
+
+                else:
+
+                    area_ratio = 0
+
+                # Combined score
                 score = (
                     self.w_conf * conf
                     +
@@ -133,6 +153,10 @@ class SingleBallTracker:
 
                     best_score = score
                     best_det = det
+
+            # ==========================================
+            # Valid tracking detection
+            # ==========================================
 
             if best_det is not None:
 
@@ -149,6 +173,10 @@ class SingleBallTracker:
 
                 return self.last_bbox
 
+            # ==========================================
+            # Ball temporarily lost
+            # ==========================================
+
             else:
 
                 self.lost_frames += 1
@@ -160,12 +188,13 @@ class SingleBallTracker:
 
 
 # ==========================================
-# Processing
+# Processing Video
 # ==========================================
+
 def process_video(video_path):
 
     timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
+        "%Y%m%d_%H%M%S_%f"
     )
 
     output_dir = os.path.join(
@@ -182,6 +211,7 @@ def process_video(video_path):
     # ==========================================
     # Output files
     # ==========================================
+
     temp_output = os.path.join(
         output_dir,
         "output_temp.avi"
@@ -193,13 +223,21 @@ def process_video(video_path):
     )
 
     # ==========================================
-    # Load model
+    # Load YOLO model
     # ==========================================
+
+    status = st.empty()
+
+    status.info(
+        "Loading YOLO model..."
+    )
+
     model = YOLO(MODEL_PATH)
 
     # ==========================================
     # Open input video
     # ==========================================
+
     cap = cv2.VideoCapture(video_path)
 
     if not cap.isOpened():
@@ -227,12 +265,14 @@ def process_video(video_path):
     # ==========================================
     # Safety checks
     # ==========================================
+
     if width <= 0 or height <= 0:
 
         cap.release()
 
         raise RuntimeError(
-            f"Invalid video resolution: {width}x{height}"
+            f"Invalid video resolution: "
+            f"{width}x{height}"
         )
 
     if fps <= 0 or np.isnan(fps):
@@ -240,12 +280,15 @@ def process_video(video_path):
         fps = 25.0
 
     # ==========================================
-    # IMPORTANT:
-    # Write AVI first using MJPG.
+    # Create temporary AVI
     #
-    # This is much more reliable with OpenCV
-    # than directly writing MP4 with mp4v.
+    # MJPG is usually reliable with OpenCV.
     # ==========================================
+
+    status.info(
+        "Preparing video output..."
+    )
+
     fourcc = cv2.VideoWriter_fourcc(
         *"MJPG"
     )
@@ -265,17 +308,20 @@ def process_video(video_path):
             "Could not create temporary output video."
         )
 
+    # ==========================================
+    # Initialize tracker
+    # ==========================================
+
     tracker = SingleBallTracker()
 
     progress = st.progress(0)
-
-    status = st.empty()
 
     frame_id = 0
 
     # ==========================================
     # Processing loop
     # ==========================================
+
     while cap.isOpened():
 
         ret, frame = cap.read()
@@ -286,8 +332,9 @@ def process_video(video_path):
         frame_id += 1
 
         # ==========================================
-        # YOLO
+        # YOLO Prediction
         # ==========================================
+
         results = model.predict(
             frame,
             conf=CONF_THRESHOLD_TRACK,
@@ -299,56 +346,74 @@ def process_video(video_path):
         # ==========================================
         # Candidate filtering
         # ==========================================
-        for box in results[0].boxes:
 
-            x1, y1, x2, y2 = (
-                box.xyxy[0]
-                .cpu()
-                .numpy()
-            )
+        if (
+            results
+            and
+            len(results) > 0
+            and
+            results[0].boxes is not None
+        ):
 
-            conf = float(
-                box.conf[0]
-                .cpu()
-                .numpy()
-            )
+            for box in results[0].boxes:
 
-            w = x2 - x1
-            h = y2 - y1
-
-            area = w * h
-
-            if w > 0 and h > 0:
-
-                aspect_ratio = max(
-                    w / h,
-                    h / w
+                x1, y1, x2, y2 = (
+                    box.xyxy[0]
+                    .cpu()
+                    .numpy()
                 )
 
-            else:
-
-                aspect_ratio = 99
-
-            if (
-                MIN_AREA < area < MAX_AREA
-                and
-                aspect_ratio < MAX_ASPECT_RATIO
-            ):
-
-                candidates.append(
-                    [
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        conf,
-                        area
-                    ]
+                conf = float(
+                    box.conf[0]
+                    .cpu()
+                    .numpy()
                 )
+
+                w = x2 - x1
+                h = y2 - y1
+
+                area = w * h
+
+                # ==========================================
+                # Valid dimensions
+                # ==========================================
+
+                if w > 0 and h > 0:
+
+                    aspect_ratio = max(
+                        w / h,
+                        h / w
+                    )
+
+                else:
+
+                    aspect_ratio = 99
+
+                # ==========================================
+                # Geometry filtering
+                # ==========================================
+
+                if (
+                    MIN_AREA < area < MAX_AREA
+                    and
+                    aspect_ratio < MAX_ASPECT_RATIO
+                ):
+
+                    candidates.append(
+                        [
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            conf,
+                            area
+                        ]
+                    )
 
         # ==========================================
         # Tracker
         # ==========================================
+
         ball_bbox = tracker.process_frame(
             candidates
         )
@@ -356,6 +421,7 @@ def process_video(video_path):
         # ==========================================
         # Draw Ball
         # ==========================================
+
         if ball_bbox is not None:
 
             x1, y1, x2, y2 = map(
@@ -363,7 +429,10 @@ def process_video(video_path):
                 ball_bbox
             )
 
+            # ==========================================
             # Safety clamp
+            # ==========================================
+
             x1 = max(
                 0,
                 min(x1, width - 1)
@@ -384,6 +453,10 @@ def process_video(video_path):
                 min(y2, height - 1)
             )
 
+            # ==========================================
+            # Ball bounding box
+            # ==========================================
+
             cv2.rectangle(
                 frame,
                 (x1, y1),
@@ -391,6 +464,10 @@ def process_video(video_path):
                 (0, 255, 0),
                 2
             )
+
+            # ==========================================
+            # Ball center
+            # ==========================================
 
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
@@ -404,103 +481,194 @@ def process_video(video_path):
             )
 
         # ==========================================
-        # Write frame
+        # Write processed frame
         # ==========================================
+
         out.write(frame)
 
         # ==========================================
         # Progress
         # ==========================================
+
         if total_frames > 0:
 
+            progress_value = (
+                frame_id / total_frames
+            )
+
             progress.progress(
-                min(
-                    frame_id / total_frames,
-                    1.0
-                )
+                min(progress_value, 1.0)
             )
 
             status.text(
-                f"Processing: "
+                f"Processing video: "
                 f"{frame_id}/{total_frames}"
             )
 
     # ==========================================
     # Close video
     # ==========================================
+
     cap.release()
     out.release()
 
     progress.empty()
 
-    status.text(
-        "Converting output video..."
-    )
+    # ==========================================
+    # Verify temporary AVI
+    # ==========================================
+
+    if (
+        not os.path.exists(temp_output)
+        or
+        os.path.getsize(temp_output) == 0
+    ):
+
+        raise RuntimeError(
+            "Temporary AVI video was not created correctly."
+        )
 
     # ==========================================
     # Convert AVI -> MP4
     #
-    # OpenCV may not have a proper H264 encoder,
-    # so use FFmpeg if available.
+    # IMPORTANT:
+    # We use imageio-ffmpeg so the deployment
+    # does NOT need a system FFmpeg installation.
     # ==========================================
-    ffmpeg_command = (
-        f'ffmpeg -y '
-        f'-i "{temp_output}" '
-        f'-c:v libx264 '
-        f'-preset fast '
-        f'-crf 23 '
-        f'-pix_fmt yuv420p '
-        f'-movflags +faststart '
-        f'"{final_output}"'
+
+    status.info(
+        "Converting output video to MP4..."
     )
 
-    return_code = os.system(
-        ffmpeg_command
-    )
+    try:
 
-    # ==========================================
-    # If FFmpeg conversion succeeded
-    # ==========================================
-    if (
-        return_code == 0
-        and
-        os.path.exists(final_output)
-        and
-        os.path.getsize(final_output) > 0
-    ):
+        # Get FFmpeg executable bundled with
+        # imageio-ffmpeg
+        ffmpeg_exe = (
+            imageio_ffmpeg.get_ffmpeg_exe()
+        )
 
-        try:
-            os.remove(
-                temp_output
+        # ==========================================
+        # FFmpeg command
+        # ==========================================
+
+        command = [
+            ffmpeg_exe,
+
+            "-y",
+
+            "-i",
+            temp_output,
+
+            # H.264 video
+            "-c:v",
+            "libx264",
+
+            # Encoding speed
+            "-preset",
+            "fast",
+
+            # Quality
+            "-crf",
+            "23",
+
+            # Browser-compatible pixel format
+            "-pix_fmt",
+            "yuv420p",
+
+            # Better streaming/browser compatibility
+            "-movflags",
+            "+faststart",
+
+            final_output
+        ]
+
+        # ==========================================
+        # Run FFmpeg
+        # ==========================================
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        # ==========================================
+        # Successful conversion
+        # ==========================================
+
+        if (
+            result.returncode == 0
+            and
+            os.path.exists(final_output)
+            and
+            os.path.getsize(final_output) > 0
+        ):
+
+            # Remove temporary AVI
+            try:
+
+                os.remove(
+                    temp_output
+                )
+
+            except Exception:
+                pass
+
+            status.success(
+                "Analysis Completed Successfully!"
             )
-        except:
-            pass
 
-        status.success(
-            "Analysis Completed"
-        )
+            return final_output
 
-        return final_output
+        # ==========================================
+        # FFmpeg conversion failed
+        # ==========================================
+
+        else:
+
+            error_message = result.stderr
+
+            if not error_message:
+
+                error_message = (
+                    "Unknown FFmpeg conversion error."
+                )
+
+            st.error(
+                "MP4 conversion failed."
+            )
+
+            st.code(
+                error_message[-3000:]
+            )
+
+            # Return AVI so the user still
+            # gets the processed video
+            return temp_output
 
     # ==========================================
-    # FFmpeg unavailable:
-    # use AVI as fallback
+    # FFmpeg exception
     # ==========================================
-    else:
 
-        status.warning(
-            "MP4 conversion failed. "
-            "Using AVI output instead."
+    except Exception as e:
+
+        st.error(
+            f"FFmpeg error: {e}"
         )
 
+        # AVI fallback
         return temp_output
 
 
 # ==========================================
 # Streamlit UI
 # ==========================================
+
 st.set_page_config(
-    page_title="Ball Tracker",
+    page_title="Football Ball Tracker",
+    page_icon="⚽",
     layout="wide"
 )
 
@@ -508,9 +676,15 @@ st.title(
     "⚽ Football Ball Tracker"
 )
 
+st.caption(
+    "YOLO Ball Detection + Single Ball Tracking"
+)
+
+
 # ==========================================
 # Session State
 # ==========================================
+
 if "output_video" not in st.session_state:
 
     st.session_state.output_video = None
@@ -524,6 +698,7 @@ if "view_mode" not in st.session_state:
 # ==========================================
 # Upload
 # ==========================================
+
 uploaded_video = st.file_uploader(
     "Upload Match Video",
     type=[
@@ -535,11 +710,27 @@ uploaded_video = st.file_uploader(
 )
 
 
+# ==========================================
+# Video Uploaded
+# ==========================================
+
 if uploaded_video:
+
+    # ==========================================
+    # Save uploaded video temporarily
+    # ==========================================
+
+    file_extension = os.path.splitext(
+        uploaded_video.name
+    )[1].lower()
+
+    if not file_extension:
+
+        file_extension = ".mp4"
 
     temp_video = tempfile.NamedTemporaryFile(
         delete=False,
-        suffix=".mp4"
+        suffix=file_extension
     )
 
     temp_video.write(
@@ -550,6 +741,10 @@ if uploaded_video:
 
     original_video = temp_video.name
 
+    # ==========================================
+    # Layout
+    # ==========================================
+
     left, right = st.columns(
         [1, 2]
     )
@@ -557,11 +752,16 @@ if uploaded_video:
     # ==========================================
     # Controls
     # ==========================================
+
     with left:
 
         st.subheader(
             "Controls"
         )
+
+        # ==========================================
+        # Analyze
+        # ==========================================
 
         if st.button(
             "🚀 Analyze Video",
@@ -570,23 +770,36 @@ if uploaded_video:
 
             try:
 
+                # Reset previous output
+                st.session_state.output_video = None
+
+                # Process
+                output_path = process_video(
+                    original_video
+                )
+
+                # Save result
                 st.session_state.output_video = (
-                    process_video(
-                        original_video
-                    )
+                    output_path
                 )
 
                 st.session_state.view_mode = (
                     "analysis"
                 )
 
+                st.rerun()
+
             except Exception as e:
 
                 st.error(
-                    f"Error: {e}"
+                    f"Error during analysis: {e}"
                 )
 
         st.markdown("---")
+
+        # ==========================================
+        # View buttons
+        # ==========================================
 
         col1, col2 = st.columns(2)
 
@@ -601,6 +814,8 @@ if uploaded_video:
                     "original"
                 )
 
+                st.rerun()
+
         with col2:
 
             if st.button(
@@ -612,10 +827,17 @@ if uploaded_video:
                     "analysis"
                 )
 
+                st.rerun()
+
     # ==========================================
     # Video Display
     # ==========================================
+
     with right:
+
+        # ==========================================
+        # Analysis video
+        # ==========================================
 
         if (
             st.session_state.view_mode
@@ -632,19 +854,53 @@ if uploaded_video:
                 "Analysis Result"
             )
 
-            # Read video bytes
-            with open(
-                st.session_state.output_video,
-                "rb"
-            ) as video_file:
+            output_path = (
+                st.session_state.output_video
+            )
 
-                video_bytes = (
-                    video_file.read()
+            # ==========================================
+            # MP4
+            # ==========================================
+
+            if output_path.lower().endswith(
+                ".mp4"
+            ):
+
+                st.video(
+                    output_path
                 )
 
-            st.video(
-                video_bytes
-            )
+            # ==========================================
+            # AVI fallback
+            # ==========================================
+
+            else:
+
+                st.warning(
+                    "The processed video is AVI "
+                    "because MP4 conversion failed."
+                )
+
+                with open(
+                    output_path,
+                    "rb"
+                ) as video_file:
+
+                    video_bytes = (
+                        video_file.read()
+                    )
+
+                st.download_button(
+                    label="⬇️ Download AVI Result",
+                    data=video_bytes,
+                    file_name="output.avi",
+                    mime="video/x-msvideo",
+                    use_container_width=True
+                )
+
+        # ==========================================
+        # Original video
+        # ==========================================
 
         else:
 
@@ -655,4 +911,3 @@ if uploaded_video:
             st.video(
                 original_video
             )
-
