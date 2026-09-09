@@ -1,5 +1,5 @@
 streamlit
 ultralytics
-opencv-python-headless==4.14.0.94
+opencv-python-headless
 numpy
 imageio-ffmpeg
